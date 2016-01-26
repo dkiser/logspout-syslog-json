@@ -8,7 +8,8 @@ Follow the instructions in https://github.com/gliderlabs/logspout/tree/master/cu
 
 ```
 import (
-	_ "github.com/dkiser/logspout-syslog-json"
+	_ "github.com/dkiser/logspout-syslog-json/adapters/json"
+	_ "github.com/dkiser/logspout-syslog-json/adapters/syslog"
 	_ "github.com/gliderlabs/logspout/transports/udp"
 )
 ```
