@@ -12,7 +12,7 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/gliderlabs/logspout/adapters/json"
+	"github.com/dkiser/logspout-syslog-json/adapters/json"
 	"github.com/gliderlabs/logspout/router"
 )
 
