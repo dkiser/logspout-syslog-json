@@ -110,7 +110,6 @@ func (a *SyslogAdapter) Stream(logstream chan *router.Message) {
 			log.Println("syslog:", err)
 			continue
 		}
-		log.Println("output:", string(buf.Bytes()))
 		_, err = a.conn.Write(buf.Bytes())
 		if err != nil {
 			log.Println("syslog:", err)
