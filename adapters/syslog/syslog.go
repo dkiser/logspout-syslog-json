@@ -8,7 +8,6 @@ import (
 	"log/syslog"
 	"net"
 	"os"
-	"strings"
 	"text/template"
 	"time"
 
@@ -23,7 +22,7 @@ func init() {
 	router.AdapterFactories.Register(NewSyslogAdapter, "syslog")
 }
 
-func getopt(name, dfault string) string {
+func getopt(name string, dfault string) string {
 	value := os.Getenv(name)
 	if value == "" {
 		value = dfault
@@ -31,39 +30,46 @@ func getopt(name, dfault string) string {
 	return value
 }
 
+func getoptexists(name string) bool {
+	value := os.Getenv(name)
+	if value == "" {
+		return false
+	}
+	return true
+}
+
 func NewSyslogAdapter(route *router.Route) (router.LogAdapter, error) {
 	transport, found := router.AdapterTransports.Lookup(route.AdapterTransport("udp"))
 	if !found {
-		return nil, errors.New("unable to find adapter: " + route.Adapter)
+		return nil, errors.New("bad transport: " + route.Adapter)
 	}
 	conn, err := transport.Dial(route.Address, route.Options)
 	if err != nil {
 		return nil, err
 	}
 
-	format := getopt("SYSLOG_FORMAT", "rfc3164")
+	format := getopt("SYSLOG_FORMAT", "rfc5424")
 	priority := getopt("SYSLOG_PRIORITY", "{{.Priority}}")
 	hostname := getopt("SYSLOG_HOSTNAME", "{{.Container.Config.Hostname}}")
 	pid := getopt("SYSLOG_PID", "{{.Container.State.Pid}}")
 	tag := getopt("SYSLOG_TAG", "{{.ContainerName}}"+route.Options["append_tag"])
 	structuredData := getopt("SYSLOG_STRUCTURED_DATA", "")
-	json := os.Getenv("SYSLOG_JSON")
-	var json_flag bool
-	if json == "" {
-		json_flag = false
-	} else {
-		json_flag = true
-	}
 	if route.Options["structured_data"] != "" {
 		structuredData = route.Options["structured_data"]
 	}
-
 	data := getopt("SYSLOG_DATA", "{{.Data}}")
+	json := getoptexists("SYSLOG_JSON")
+
+	if structuredData == "" {
+		structuredData = "-"
+	} else {
+		structuredData = fmt.Sprintf("[%s]", structuredData)
+	}
 
 	var tmplStr string
 	switch format {
 	case "rfc5424":
-		tmplStr = fmt.Sprintf("<%d>1 {{.Timestamp}} %s %s %d - [%s] %s\n",
+		tmplStr = fmt.Sprintf("<%s>1 {{.Timestamp}} %s %s %s - %s %s\n",
 			priority, hostname, tag, pid, structuredData, data)
 	case "rfc3164":
 		tmplStr = fmt.Sprintf("<%s>{{.Timestamp}} %s %s[%s]: %s\n",
@@ -71,69 +77,158 @@ func NewSyslogAdapter(route *router.Route) (router.LogAdapter, error) {
 	default:
 		return nil, errors.New("unsupported syslog format: " + format)
 	}
-
+	tmpl, err := template.New("syslog").Parse(tmplStr)
+	if err != nil {
+		return nil, err
+	}
 	return &SyslogAdapter{
-		route:   route,
-		conn:    conn,
-		tmplStr: tmplStr,
-		json:    json_flag,
+		route:     route,
+		conn:      conn,
+		tmpl:      tmpl,
+		transport: transport,
+		json:      json,
 	}, nil
 }
 
 type SyslogAdapter struct {
-	conn    net.Conn
-	route   *router.Route
-	tmplStr string
-	json    bool
+	conn      net.Conn
+	route     *router.Route
+	tmpl      *template.Template
+	transport router.AdapterTransport
+	json      bool
 }
 
 func (a *SyslogAdapter) Stream(logstream chan *router.Message) {
-	defer a.route.Close()
 	for message := range logstream {
-		m := NewSyslogMessage(message, a.conn)
+		m := &SyslogMessage{message}
+        var err error = nil
+        var buf []byte = nil
 		if a.json {
-			js, err := json.NewJSONMessage(message)
+			buf, err = m.RenderJSON(a.tmpl)
 			if err != nil {
-				log.Println("syslog: failed to get json, falling back:", err)
-			} else {
-				a.tmplStr = strings.Replace(a.tmplStr, "{{.Data}}", string(js), 1)
+				log.Println("syslog: json failure:", err)
+				return
+			}
+		} else {
+			buf, err = m.Render(a.tmpl)
+			if err != nil {
+				log.Println("syslog: failure:", err)
+				return
 			}
 		}
+		_, err = a.conn.Write(buf)
+		if err != nil {
+			log.Println("syslog:", err)
+			switch a.conn.(type) {
+			case *net.UDPConn:
+				continue
+			default:
+				err = a.retry(buf, err)
+				if err != nil {
+					log.Println("syslog:", err)
+					return
+				}
+			}
+		}
+	}
+}
 
-		tmpl, err := template.New("syslog").Parse(a.tmplStr)
-		if err != nil {
-			log.Println("syslog:", err)
-			continue
+func (a *SyslogAdapter) retry(buf []byte, err error) error {
+	if opError, ok := err.(*net.OpError); ok {
+		if opError.Temporary() || opError.Timeout() {
+			retryErr := a.retryTemporary(buf)
+			if retryErr == nil {
+				return nil
+			}
 		}
-		buf, err := m.Render(tmpl)
-		if err != nil {
-			log.Println("syslog:", err)
-			continue
+	}
+
+	return a.reconnect()
+}
+
+func (a *SyslogAdapter) retryTemporary(buf []byte) error {
+	log.Println("syslog: retrying tcp up to 11 times")
+	err := retryExp(func() error {
+		_, err := a.conn.Write(buf)
+		if err == nil {
+			log.Println("syslog: retry successful")
+			return nil
 		}
-		_, err = a.conn.Write(buf.Bytes())
+
+		return err
+	}, 11)
+
+	if err != nil {
+		log.Println("syslog: retry failed")
+		return err
+	}
+
+	return nil
+}
+
+func (a *SyslogAdapter) reconnect() error {
+	log.Println("syslog: reconnecting up to 11 times")
+	err := retryExp(func() error {
+		conn, err := a.transport.Dial(a.route.Address, a.route.Options)
 		if err != nil {
-			log.Println("syslog:", err)
-			continue
+			return err
 		}
+
+		a.conn = conn
+		return nil
+	}, 11)
+
+	if err != nil {
+		log.Println("syslog: reconnect failed")
+		return err
+	}
+
+	return nil
+}
+
+func retryExp(fun func() error, tries uint) error {
+	try := uint(0)
+	for {
+		err := fun()
+		if err == nil {
+			return nil
+		}
+
+		try++
+		if try > tries {
+			return err
+		}
+
+		time.Sleep((1 << try) * 10 * time.Millisecond)
 	}
 }
 
 type SyslogMessage struct {
 	*router.Message
-	conn net.Conn
 }
 
-func NewSyslogMessage(message *router.Message, conn net.Conn) *SyslogMessage {
-	return &SyslogMessage{message, conn}
-}
-
-func (m *SyslogMessage) Render(tmpl *template.Template) (*bytes.Buffer, error) {
+func (m *SyslogMessage) Render(tmpl *template.Template) ([]byte, error) {
 	buf := new(bytes.Buffer)
 	err := tmpl.Execute(buf, m)
 	if err != nil {
 		return nil, err
 	}
-	return buf, nil
+	return buf.Bytes(), nil
+}
+
+func (m *SyslogMessage) RenderJSON(tmpl *template.Template) ([]byte, error) {
+	js, err := json.NewJSONMessage(m.Message)
+	if err != nil {
+		return nil, err
+	}
+    // replace data with full json representation
+    m.Data = string(js)
+    buf := new(bytes.Buffer)
+    err2 := tmpl.Execute(buf, m)
+    if err2 != nil {
+		return nil, err2
+	}
+	return buf.Bytes(), nil
 }
 
 func (m *SyslogMessage) Priority() syslog.Priority {
@@ -149,10 +244,6 @@ func (m *SyslogMessage) Priority() syslog.Priority {
 
 func (m *SyslogMessage) Hostname() string {
 	return hostname
-}
-
-func (m *SyslogMessage) LocalAddr() string {
-	return m.conn.LocalAddr().String()
 }
 
 func (m *SyslogMessage) Timestamp() string {
